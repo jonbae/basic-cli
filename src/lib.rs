@@ -23,6 +23,8 @@ mod process_service;
 mod sqlite;
 mod tcp;
 mod listener;
+// PROTOTYPE: effect ledger supervisor wiring (throwaway)
+mod ledger_prototype;
 
 use crate::roc_platform_abi::*;
 
@@ -2025,17 +2027,24 @@ pub extern "C" fn hosted_sleep_millis(millis: u64) {
 
 #[no_mangle]
 pub extern "C" fn hosted_stderr_line(message: RocStr) -> StderrUnitResult {
+    // PROTOTYPE: wrapped too, because main_for_host! reports an unhandled Err here.
     let roc_host = roc_host();
-    let result = {
-        let mut stderr = io::stderr().lock();
-        writeln!(stderr, "{}", message.as_str())
+    let write = |message: &RocStr| writeln!(io::stderr().lock(), "{}", message.as_str());
+    let result = match ledger_prototype::link() {
+        None => write(&message),
+        Some(link) => {
+            let seq = link.begin("hosted_stderr_line", message.as_str().as_bytes());
+            if link.replaying() {
+                decode_unit_response(&link.await_response())
+            } else {
+                let result = write(&message);
+                link.end(seq, &encode_unit_response(&result));
+                result
+            }
+        }
     };
     unsafe { message.decref(roc_host) };
-
-    match result {
-        Ok(()) => try_stderr_unit_ok(),
-        Err(error) => try_stderr_unit_err(stderr_io_err_from_io(&error, roc_host)),
-    }
+    unit_result_to_roc(result, try_stderr_unit_ok, try_stderr_unit_err, stderr_io_err_from_io)
 }
 
 #[no_mangle]
@@ -2070,16 +2079,47 @@ pub extern "C" fn hosted_stderr_write_bytes(bytes: RocListWith<u8, false>) -> St
     }
 }
 
+// PROTOTYPE: hand-written ledger wrapper; codegen would emit these.
+// Response bytes: 0 + line | 1 (EOF) | 2 + raw os error (i32 LE).
 #[no_mangle]
 pub extern "C" fn hosted_stdin_line() -> HostStdinLineResult {
-    let roc_host = roc_host();
-    let mut line = String::new();
-    match io::stdin().lock().read_line(&mut line) {
-        Ok(0) => try_stdin_line_err(stdin_line_eof_or_err_eof()),
-        Ok(_) => {
-            let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-            try_stdin_line_ok(RocStr::from_str(trimmed, roc_host))
+    let Some(link) = ledger_prototype::link() else {
+        return stdin_line_to_roc(stdin_line_io());
+    };
+    let seq = link.begin("hosted_stdin_line", &[]);
+    let result = if link.replaying() {
+        let response = link.await_response();
+        match response[0] {
+            0 => Ok(Some(String::from_utf8_lossy(&response[1..]).into_owned())),
+            1 => Ok(None),
+            _ => Err(io::Error::from_raw_os_error(i32::from_le_bytes(response[1..5].try_into().unwrap()))),
         }
+    } else {
+        let result = stdin_line_io();
+        let response = match &result {
+            Ok(Some(line)) => [&[0u8][..], line.as_bytes()].concat(),
+            Ok(None) => vec![1],
+            Err(e) => [&[2u8][..], &e.raw_os_error().unwrap_or(0).to_le_bytes()].concat(),
+        };
+        link.end(seq, &response);
+        result
+    };
+    stdin_line_to_roc(result)
+}
+
+fn stdin_line_io() -> io::Result<Option<String>> {
+    let mut line = String::new();
+    match io::stdin().lock().read_line(&mut line)? {
+        0 => Ok(None),
+        _ => Ok(Some(line.trim_end_matches('\n').trim_end_matches('\r').to_string())),
+    }
+}
+
+fn stdin_line_to_roc(result: io::Result<Option<String>>) -> HostStdinLineResult {
+    let roc_host = roc_host();
+    match result {
+        Ok(None) => try_stdin_line_err(stdin_line_eof_or_err_eof()),
+        Ok(Some(line)) => try_stdin_line_ok(RocStr::from_str(&line, roc_host)),
         Err(error) => try_stdin_line_err(stdin_line_eof_or_err_io(stdin_io_err_from_io(
             &error, roc_host,
         ))),
@@ -2111,18 +2151,54 @@ pub extern "C" fn hosted_stdin_read_to_end() -> HostStdinReadToEndResult {
     }
 }
 
+// PROTOTYPE: hand-written ledger wrapper; codegen would emit these.
+// Request bytes: the line. Response bytes: 0 | 1 + raw os error (i32 LE).
 #[no_mangle]
 pub extern "C" fn hosted_stdout_line(message: RocStr) -> StdoutUnitResult {
     let roc_host = roc_host();
-    let result = {
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{}", message.as_str())
+    let Some(link) = ledger_prototype::link() else {
+        let result = writeln!(io::stdout().lock(), "{}", message.as_str());
+        unsafe { message.decref(roc_host) };
+        return unit_result_to_roc(result, try_stdout_unit_ok, try_stdout_unit_err, stdout_io_err_from_io);
     };
-    unsafe { message.decref(roc_host) };
+    // Encode the request before anything releases it.
+    let seq = link.begin("hosted_stdout_line", message.as_str().as_bytes());
+    let result = if link.replaying() {
+        // The inner fn would have consumed the argument; replay must too.
+        unsafe { message.decref(roc_host) };
+        decode_unit_response(&link.await_response())
+    } else {
+        let result = writeln!(io::stdout().lock(), "{}", message.as_str());
+        unsafe { message.decref(roc_host) };
+        link.end(seq, &encode_unit_response(&result));
+        result
+    };
+    unit_result_to_roc(result, try_stdout_unit_ok, try_stdout_unit_err, stdout_io_err_from_io)
+}
 
+fn encode_unit_response(result: &io::Result<()>) -> Vec<u8> {
     match result {
-        Ok(()) => try_stdout_unit_ok(),
-        Err(error) => try_stdout_unit_err(stdout_io_err_from_io(&error, roc_host)),
+        Ok(()) => vec![0],
+        Err(e) => [&[1u8][..], &e.raw_os_error().unwrap_or(0).to_le_bytes()].concat(),
+    }
+}
+
+fn decode_unit_response(response: &[u8]) -> io::Result<()> {
+    match response[0] {
+        0 => Ok(()),
+        _ => Err(io::Error::from_raw_os_error(i32::from_le_bytes(response[1..5].try_into().unwrap()))),
+    }
+}
+
+fn unit_result_to_roc<T, E>(
+    result: io::Result<()>,
+    ok: fn() -> T,
+    err: fn(E) -> T,
+    from_io: fn(&io::Error, &RocHost) -> E,
+) -> T {
+    match result {
+        Ok(()) => ok(),
+        Err(error) => err(from_io(&error, roc_host())),
     }
 }
 
@@ -2207,11 +2283,13 @@ pub extern "C" fn roc_dbg(bytes: *const u8, len: usize) {
 #[no_mangle]
 pub extern "C" fn roc_expect_failed(bytes: *const u8, len: usize) {
     DEBUG_OR_EXPECT_CALLED.store(true, Ordering::Release);
+    ledger_prototype::expect_failed(unsafe { core::slice::from_raw_parts(bytes, len) });
     DefaultHandlers::roc_expect_failed(roc_host_ptr(), bytes, len);
 }
 
 #[no_mangle]
 pub extern "C" fn roc_crashed(bytes: *const u8, len: usize) {
+    ledger_prototype::crashed(unsafe { core::slice::from_raw_parts(bytes, len) });
     DefaultHandlers::roc_crashed(roc_host_ptr(), bytes, len);
 }
 
@@ -2305,14 +2383,20 @@ pub fn rust_main(argc: i32, argv: *const *const c_char) -> i32 {
     // std::process restores SIGPIPE's default disposition in spawned children.
     #[cfg(unix)]
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
+    let process_args = collect_process_args(argc, argv);
+    // PROTOTYPE: a supervisor never runs Roc code; a ledger child carries on.
+    if let Some(code) = ledger_prototype::start(&process_args) {
+        return code;
+    }
     let mut roc_host = resources::make_host();
     set_roc_host(&mut roc_host);
 
-    let (program_name, args) = split_program_name(collect_process_args(argc, argv));
+    let (program_name, args) = split_program_name(process_args);
     set_program_name(program_name);
 
     let args_list = build_args_list(&args, &roc_host);
     let mut exit_code = unsafe { roc_main(args_list) };
+    ledger_prototype::returned(exit_code);
 
     process_service::shutdown();
 
