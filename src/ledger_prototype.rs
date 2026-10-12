@@ -4,7 +4,8 @@
 //! effect-ledger map. Hand-written, no codegen, payloads are opaque bytes.
 //! Unix only. Not production code: errors mostly abort with a message.
 //!
-//! Switch: `ROC_LEDGER=record:<dir>` or `ROC_LEDGER=replay:<dir>`.
+//! Switch: `ROC_LEDGER=record:<dir>` or `ROC_LEDGER=replay:<dir>`, and
+//! (MVP 3) `ROC_LEDGER=dump:<dir>`, which prints what the request did.
 //! A ledger is a directory: `<dir>/spans.jsonl` (OTLP JSON Lines) and
 //! `<dir>/exe` (the pinned binary).
 
@@ -23,12 +24,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use serde_json::{json, Value};
 
+use crate::ledger_codec;
+
 const SPANS: &str = "spans.jsonl";
 const PINNED: &str = "exe";
 const CHILD_ENV: &str = "ROC_LEDGER_CHILD";
 
 // The boundary the pinned binary knows. Codegen would emit all 85 symbols.
-const BOUNDARY: &[&str] = &["hosted_stdout_line", "hosted_stderr_line", "hosted_stdin_line"];
+const BOUNDARY: &[&str] = &[
+    "hosted_stdout_line",
+    "hosted_stderr_line",
+    "hosted_stdin_line",
+    // MVP
+    "hosted_file_read_utf8",
+    "hosted_utc_now",
+];
 
 // ---------------------------------------------------------------- frames
 //
@@ -93,12 +103,14 @@ pub fn start(process_args: &[OsString]) -> Option<i32> {
         return None;
     }
     let spec = std::env::var_os("ROC_LEDGER")?.to_string_lossy().into_owned();
-    let (mode, dir) = spec.split_once(':').unwrap_or_else(|| die(64, "ROC_LEDGER must be record:<dir> or replay:<dir>"));
+    let usage = "ROC_LEDGER must be record:<dir>, replay:<dir> or dump:<dir>";
+    let (mode, dir) = spec.split_once(':').unwrap_or_else(|| die(64, usage));
     let dir = PathBuf::from(dir);
     match mode {
         "record" => Some(record(&dir, process_args)),
         "replay" => Some(replay(&dir, process_args)),
-        _ => die(64, "ROC_LEDGER must be record:<dir> or replay:<dir>"),
+        "dump" => Some(dump(&dir, process_args)),
+        _ => die(64, usage),
     }
 }
 
@@ -263,8 +275,8 @@ fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
-fn unb64(s: &str) -> Vec<u8> {
-    base64::engine::general_purpose::STANDARD.decode(s).expect("base64")
+fn unb64(s: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
 impl Outcome {
@@ -280,22 +292,26 @@ impl Outcome {
         }
     }
 
-    fn from_json(v: &Value) -> Outcome {
+    fn from_json(bytes: &[u8]) -> Option<Outcome> {
+        let v: Value = serde_json::from_slice(bytes).ok()?;
         if let Some(c) = v.get("returned") {
-            return Outcome::Returned(c.as_i64().unwrap() as i32);
+            return Some(Outcome::Returned(c.as_i64()? as i32));
         }
         if let Some(m) = v.get("crashed") {
-            return Outcome::Crashed(m.as_str().unwrap().to_string());
+            return Some(Outcome::Crashed(m.as_str()?.to_string()));
         }
         if let Some(c) = v.get("exited") {
-            return Outcome::Exited(c.as_i64().unwrap() as i32);
+            return Some(Outcome::Exited(c.as_i64()? as i32));
         }
-        let in_flight = v.get("in_flight").filter(|f| !f.is_null()).map(|f| InFlight {
-            seq: f["seq"].as_u64().unwrap(),
-            effect: f["effect"].as_str().unwrap().to_string(),
-            request: unb64(f["request"].as_str().unwrap()),
-        });
-        Outcome::Signaled { signal: v["signal"].as_i64().unwrap() as i32, in_flight }
+        let in_flight = match v.get("in_flight").filter(|f| !f.is_null()) {
+            None => None,
+            Some(f) => Some(InFlight {
+                seq: f["seq"].as_u64()?,
+                effect: f["effect"].as_str()?.to_string(),
+                request: unb64(f["request"].as_str()?)?,
+            }),
+        };
+        Some(Outcome::Signaled { signal: v["signal"].as_i64()? as i32, in_flight })
     }
 
     fn describe(&self) -> String {
@@ -447,14 +463,14 @@ fn encode_args(args: &[OsString]) -> Vec<u8> {
     b
 }
 
-fn decode_args(mut b: &[u8]) -> Vec<OsString> {
+fn decode_args(mut b: &[u8]) -> Option<Vec<OsString>> {
     let mut out = Vec::new();
     while !b.is_empty() {
-        let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
-        out.push(OsString::from_vec(b[4..4 + n].to_vec()));
+        let n = u32::from_le_bytes(b.get(0..4)?.try_into().unwrap()) as usize;
+        out.push(OsString::from_vec(b.get(4..4 + n)?.to_vec()));
         b = &b[4 + n..];
     }
-    out
+    Some(out)
 }
 
 // ---------------------------------------------------------------- pinning
@@ -485,6 +501,33 @@ fn pin(src: &Path, dst: &Path) -> &'static str {
     }
     fs::copy(src, dst).unwrap_or_else(|e| die(74, &format!("cannot pin binary: {e}")));
     "copy"
+}
+
+// MVP: pin each build once into `<ledgers>/.pins/`, and hardlink every
+// ledger's exe to that copy. macOS charges ~280 ms the first time any new file
+// is executed, so a fresh clone per request made recording ~50x slower. This
+// pays it once per build. The shared copy is a clone (or copy) of the original,
+// never a hardlink to it, so overwriting the original in place can't reach it.
+fn pin_shared(src: &Path, dst: &Path) -> &'static str {
+    use std::os::unix::fs::MetadataExt;
+    let Some(store) = dst.parent().and_then(Path::parent).map(|ledgers| ledgers.join(".pins")) else {
+        return pin(src, dst);
+    };
+    // The same file with the same contents: device, inode, size, mtime (ns).
+    let m = fs::metadata(src).unwrap();
+    let shared = store.join(format!("{:x}-{:x}-{:x}-{:x}.{:x}", m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()));
+    if !shared.exists() {
+        let _ = fs::create_dir_all(&store);
+        let tmp = store.join(format!(".tmp-{}", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        pin(src, &tmp);
+        // A concurrent recorder may win the rename; both copies are the same build.
+        let _ = fs::rename(&tmp, &shared);
+    }
+    if fs::hard_link(&shared, dst).is_ok() {
+        return "shared";
+    }
+    pin(src, dst)
 }
 
 fn current_exe() -> PathBuf {
@@ -584,7 +627,7 @@ fn record(dir: &Path, process_args: &[OsString]) -> i32 {
 
     // Pin first, then run the child from the pinned copy.
     let exe = dir.join(PINNED);
-    let how = pin(&current_exe(), &exe);
+    let how = pin_shared(&current_exe(), &exe);
     let mut spans = File::create(dir.join(SPANS)).unwrap();
 
     let service = process_args
@@ -664,6 +707,18 @@ struct Entry {
     response: Vec<u8>,
 }
 
+impl Entry {
+    fn from_span(span: &Value) -> Option<Entry> {
+        let s = |k| attr(span, k).and_then(|v| v["stringValue"].as_str()).unwrap_or_default();
+        Some(Entry {
+            seq: attr(span, "ledger.seq")?["intValue"].as_str()?.parse().ok()?,
+            effect: s("ledger.effect").to_string(),
+            request: unb64(s("ledger.request"))?,
+            response: unb64(s("ledger.response"))?,
+        })
+    }
+}
+
 fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
     span["attributes"].as_array()?.iter().find(|a| a["key"] == key).map(|a| &a["value"])
 }
@@ -678,17 +733,16 @@ fn load(dir: &Path) -> (Vec<Entry>, Vec<OsString>, Outcome) {
     let mut root = None;
     for (n, line) in text.lines().enumerate() {
         let v: Value = serde_json::from_str(line).unwrap_or_else(|_| refuse(&format!("torn line {}", n + 1)));
-        let span = &v["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        let s = |k| attr(span, k).and_then(|v| v["stringValue"].as_str()).unwrap_or_default().to_string();
-        let seq: u64 = attr(span, "ledger.seq").and_then(|v| v["intValue"].as_str()).unwrap().parse().unwrap();
-        if seq == 0 {
-            root = Some((decode_args(&unb64(&s("ledger.request"))), Outcome::from_json(&serde_json::from_slice(&unb64(&s("ledger.response"))).unwrap())));
+        let not_span = || format!("line {}: not a ledger span", n + 1);
+        let Some(e) = Entry::from_span(&v["resourceSpans"][0]["scopeSpans"][0]["spans"][0]) else { refuse(&not_span()) };
+        if e.seq == 0 {
+            let (Some(args), Some(outcome)) = (decode_args(&e.request), Outcome::from_json(&e.response)) else { refuse(&not_span()) };
+            root = Some((args, outcome));
         } else {
-            let effect = s("ledger.effect");
-            if !BOUNDARY.contains(&effect.as_str()) {
-                refuse(&format!("seq {seq} names {effect}, which is outside the boundary"));
+            if !BOUNDARY.contains(&e.effect.as_str()) {
+                refuse(&format!("seq {} names {}, which is outside the boundary", e.seq, e.effect));
             }
-            entries.push(Entry { seq, effect, request: unb64(&s("ledger.request")), response: unb64(&s("ledger.response")) });
+            entries.push(e);
         }
     }
     let (args, outcome) = root.unwrap_or_else(|| refuse("incomplete: no main! span"));
@@ -707,14 +761,7 @@ fn replay(dir: &Path, process_args: &[OsString]) -> i32 {
         refuse("incomplete: no pinned binary");
     }
     // Supervisor and child must be one build: always exec the pinned binary.
-    if !same_file::is_same_file(current_exe(), &exe).unwrap_or(false) {
-        let mut cmd = Command::new(&exe);
-        if let Some(argv0) = process_args.first() {
-            cmd.arg0(argv0);
-        }
-        let err = cmd.args(&process_args[1..]).exec();
-        die(71, &format!("cannot exec the pinned binary: {err}"));
-    }
+    become_pinned(&exe, process_args);
 
     let (entries, args, recorded) = load(dir);
 
@@ -842,6 +889,17 @@ fn replay(dir: &Path, process_args: &[OsString]) -> i32 {
     }
 }
 
+fn become_pinned(exe: &Path, process_args: &[OsString]) {
+    if !same_file::is_same_file(current_exe(), exe).unwrap_or(false) {
+        let mut cmd = Command::new(exe);
+        if let Some(argv0) = process_args.first() {
+            cmd.arg0(argv0);
+        }
+        let err = cmd.args(&process_args[1..]).exec();
+        die(71, &format!("cannot exec the pinned binary: {err}"));
+    }
+}
+
 /// Replay emulates stdio writes in the supervisor, as rr does; the child
 /// itself performs nothing.
 fn echo(effect: &str, request: &[u8], seq: u64, mark: bool) {
@@ -862,4 +920,90 @@ fn echo(effect: &str, request: &[u8], seq: u64, mark: bool) {
         }
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------- dump
+
+// MVP 3: what a request did, from its ledger alone. The pinned binary decodes
+// its own payloads, so the build that wrote a ledger is the build that reads
+// it. Lenient where replay refuses: a torn line or unknown symbol is shown.
+fn dump(dir: &Path, process_args: &[OsString]) -> i32 {
+    let exe = dir.join(PINNED);
+    if !exe.exists() {
+        die(66, "no pinned binary, so nothing here can decode the payloads");
+    }
+    become_pinned(&exe, process_args);
+    let text = fs::read_to_string(dir.join(SPANS)).unwrap_or_else(|_| die(66, "no spans.jsonl"));
+
+    struct Line {
+        seq: u64,
+        effect: String,
+        start: u128,
+        end: u128,
+        request: Vec<u8>,
+        response: Vec<u8>,
+    }
+    let mut crossings = Vec::new();
+    let mut root: Option<Line> = None;
+    let (mut trace_id, mut resource) = (String::new(), Value::Null);
+    let mut problems = Vec::new();
+    for (n, text_line) in text.lines().enumerate() {
+        let Ok(v) = serde_json::from_str::<Value>(text_line) else {
+            problems.push(format!("line {}: torn", n + 1));
+            continue;
+        };
+        resource = v["resourceSpans"][0]["resource"].clone();
+        let span = &v["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        trace_id = span["traceId"].as_str().unwrap_or_default().to_string();
+        let nanos = |k: &str| span[k].as_str().and_then(|t| t.parse().ok()).unwrap_or(0);
+        let Some(Entry { seq, effect, request, response }) = Entry::from_span(span) else {
+            problems.push(format!("line {}: not a ledger span", n + 1));
+            continue;
+        };
+        let line = Line { seq, effect, start: nanos("startTimeUnixNano"), end: nanos("endTimeUnixNano"), request, response };
+        if seq == 0 {
+            root = Some(line);
+        } else {
+            crossings.push(line);
+        }
+    }
+    crossings.sort_by_key(|c| c.seq);
+
+    let resource_attr = |k| attr(&resource, k).and_then(|v| v["stringValue"].as_str()).unwrap_or("?").to_string();
+    let base = root.as_ref().map(|r| r.start).or(crossings.first().map(|c| c.start)).unwrap_or(0);
+    let offset = |t: u128| format!("+{:.2}ms", (t.saturating_sub(base)) as f64 / 1e6);
+    let call = |effect: &str, request: &[u8]| {
+        let shown = ledger_codec::display_request(effect, request).unwrap_or_else(|| format!("<{} bytes: {}>", request.len(), b64(request)));
+        format!("{effect}({shown})")
+    };
+
+    println!("ledger   {}", dir.display());
+    println!("request  {trace_id}");
+    println!("service  {} (basic-cli {}, pinned {})", resource_attr("service.name"), resource_attr("ledger.basic_cli"), resource_attr("ledger.pinned"));
+    if let Some(r) = &root {
+        let args = decode_args(&r.request).map_or("unreadable".into(), |a| format!("{:?}", a.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>()));
+        println!("args     {args}");
+        println!("started  {}", ledger_codec::iso_utc(r.start));
+    }
+    println!();
+    println!("{:>4}  {:>9}  crossing", "seq", "at");
+    for c in &crossings {
+        let shown = ledger_codec::display_response(&c.effect, &c.response).unwrap_or_else(|| format!("<{} bytes: {}>", c.response.len(), b64(&c.response)));
+        println!("{:>4}  {:>9}  {} -> {shown}", c.seq, offset(c.start), call(&c.effect, &c.request));
+    }
+    match &root {
+        Some(r) => {
+            let outcome = Outcome::from_json(&r.response);
+            if let Some(Outcome::Signaled { in_flight: Some(f), signal }) = &outcome {
+                println!("{:>4}  {:>9}  {} -> no response: {}", f.seq, "", call(&f.effect, &f.request), sig_name(*signal));
+            }
+            let described = outcome.map_or("unreadable outcome".into(), |o| o.describe());
+            println!("{:>4}  {:>9}  {described}", "end", offset(r.end));
+        }
+        None => println!("{:>4}  {:>9}  no main! span: the request never finished, or its supervisor was killed", "end", ""),
+    }
+    for p in &problems {
+        println!("[ledger] {p}");
+    }
+    0
 }

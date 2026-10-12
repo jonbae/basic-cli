@@ -25,6 +25,8 @@ mod tcp;
 mod listener;
 // PROTOTYPE: effect ledger supervisor wiring (throwaway)
 mod ledger_prototype;
+// MVP: codecs for the file_read_utf8 and utc_now wrappers
+mod ledger_codec;
 
 use crate::roc_platform_abi::*;
 
@@ -1442,20 +1444,59 @@ pub extern "C" fn hosted_file_read_bytes(path: UnixBytesOrUtf8OrWindowsU16s) -> 
     }
 }
 
+// MVP: hand-written ledger wrapper; codegen would emit these.
+// Request bytes: native_path_request. Response bytes: ledger_codec::encode_str_result.
 #[no_mangle]
 pub extern "C" fn hosted_file_read_utf8(path: UnixBytesOrUtf8OrWindowsU16s) -> FileStrResult {
     let roc_host = roc_host();
-    let path = match path_from_native(path, roc_host) {
-        Ok(path) => path,
-        Err(error) => return try_file_str_err(file_io_err_from_io(&error, roc_host)),
+    let Some(link) = ledger_prototype::link() else {
+        return file_str_to_roc(file_read_utf8_io(path, roc_host), roc_host);
     };
-    match fs::read_to_string(&path) {
+    // Encode the request before path_from_native releases it.
+    let seq = link.begin("hosted_file_read_utf8", &native_path_request(&path));
+    let result = if link.replaying() {
+        // The inner fn would have consumed the argument; replay must too.
+        let _ = path_from_native(path, roc_host);
+        ledger_codec::decode_str_result(&link.await_response())
+    } else {
+        let result = file_read_utf8_io(path, roc_host);
+        link.end(seq, &ledger_codec::encode_str_result(&result));
+        result
+    };
+    file_str_to_roc(result, roc_host)
+}
+
+fn file_read_utf8_io(path: UnixBytesOrUtf8OrWindowsU16s, roc_host: &RocHost) -> io::Result<String> {
+    let path = path_from_native(path, roc_host)?;
+    fs::read_to_string(&path).map_err(|error| normalize_file_kind_err(&path, error))
+}
+
+fn file_str_to_roc(result: io::Result<String>, roc_host: &RocHost) -> FileStrResult {
+    match result {
         Ok(content) => try_file_str_ok(RocStr::from_str(&content, roc_host)),
-        Err(error) => try_file_str_err(file_io_err_from_io(
-            &normalize_file_kind_err(&path, error),
-            roc_host,
-        )),
+        Err(error) => try_file_str_err(file_io_err_from_io(&error, roc_host)),
     }
+}
+
+// MVP: the native value as Roc holds it: tag byte, then its bytes (u16s LE).
+fn native_path_request(path: &UnixBytesOrUtf8OrWindowsU16s) -> Vec<u8> {
+    let mut request = vec![path.tag as u8];
+    unsafe {
+        match path.tag {
+            UnixBytesOrUtf8OrWindowsU16sTag::UnixBytes => {
+                request.extend_from_slice(path.borrow_payload_unix_bytes_unchecked().as_slice())
+            }
+            UnixBytesOrUtf8OrWindowsU16sTag::Utf8 => {
+                request.extend_from_slice(path.borrow_payload_utf8_unchecked().as_str().as_bytes())
+            }
+            UnixBytesOrUtf8OrWindowsU16sTag::WindowsU16s => {
+                for unit in path.borrow_payload_windows_u16s_unchecked().as_slice() {
+                    request.extend_from_slice(&unit.to_le_bytes());
+                }
+            }
+        }
+    }
+    request
 }
 
 // ============================================================================
@@ -2088,12 +2129,7 @@ pub extern "C" fn hosted_stdin_line() -> HostStdinLineResult {
     };
     let seq = link.begin("hosted_stdin_line", &[]);
     let result = if link.replaying() {
-        let response = link.await_response();
-        match response[0] {
-            0 => Ok(Some(String::from_utf8_lossy(&response[1..]).into_owned())),
-            1 => Ok(None),
-            _ => Err(io::Error::from_raw_os_error(i32::from_le_bytes(response[1..5].try_into().unwrap()))),
-        }
+        decode_stdin_line_response(&link.await_response())
     } else {
         let result = stdin_line_io();
         let response = match &result {
@@ -2105,6 +2141,15 @@ pub extern "C" fn hosted_stdin_line() -> HostStdinLineResult {
         result
     };
     stdin_line_to_roc(result)
+}
+
+// MVP 3: shared by replay and dump.
+fn decode_stdin_line_response(response: &[u8]) -> io::Result<Option<String>> {
+    match response[0] {
+        0 => Ok(Some(String::from_utf8_lossy(&response[1..]).into_owned())),
+        1 => Ok(None),
+        _ => Err(io::Error::from_raw_os_error(i32::from_le_bytes(response[1..5].try_into().unwrap()))),
+    }
 }
 
 fn stdin_line_io() -> io::Result<Option<String>> {
@@ -2247,11 +2292,33 @@ pub extern "C" fn hosted_tty_enable_raw_mode() {
 // TODO(https://github.com/roc-lang/roc/issues/10163): revert to a bare u128
 // return once the compiler emits the clang/Rust u128 return convention on
 // x86_64-windows; bare u128 returns are currently misread there.
+// MVP: hand-written ledger wrapper. Request bytes: none. Response bytes:
+// ledger_codec::encode_utc_now.
 #[no_mangle]
 pub extern "C" fn hosted_utc_now() -> HostUtcNowResult {
+    let result = match ledger_prototype::link() {
+        None => utc_now_io(),
+        Some(link) => {
+            let seq = link.begin("hosted_utc_now", &[]);
+            if link.replaying() {
+                ledger_codec::decode_utc_now(&link.await_response())
+            } else {
+                let result = utc_now_io();
+                link.end(seq, &ledger_codec::encode_utc_now(&result));
+                result
+            }
+        }
+    };
+    match result {
+        Ok(nanos) => try_utc_now_ok(nanos),
+        Err(()) => try_utc_now_err(),
+    }
+}
+
+fn utc_now_io() -> Result<u128, ()> {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => try_utc_now_ok(duration.as_nanos()),
-        Err(_) => try_utc_now_err(),
+        Ok(duration) => Ok(duration.as_nanos()),
+        Err(_) => Err(()),
     }
 }
 
