@@ -1,12 +1,67 @@
-//! MVP, throwaway: hand-written codecs for the effect-ledger MVP wrappers.
-//! Codegen would emit these from `Host.roc`.
+//! PROTOTYPE, throwaway: basic-cli's binding to the effect-ledger library.
+//! Codegen would emit this from `Host.roc`: one codec and one display per
+//! wrapped hosted function, and the boundary table the library reads.
 //!
 //! Each codec encodes what Roc sees, not the Rust-side value. An `io::Error`
 //! becomes the `IOErr` tag `define_common_io_err!` would build from it: just
 //! the tag for the nine named kinds, the message for `Other`. So decoding and
 //! converting to Roc gives the value the recording handed to Roc.
 
+use std::ffi::OsString;
 use std::io;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+use effect_ledger::{iso_utc, Boundary, Echo, Entry, Hosted};
+
+pub static BOUNDARY: Boundary = Boundary {
+    platform: "basic-cli 0.23.0",
+    hosted: &[
+        Hosted { symbol: "hosted_stdout_line", echo: Echo::Stdout, show_request: show_line, show_response: |r| show_unit(r, "StdoutErr") },
+        Hosted { symbol: "hosted_stderr_line", echo: Echo::Stderr, show_request: show_line, show_response: |r| show_unit(r, "StderrErr") },
+        Hosted { symbol: "hosted_stdin_line", echo: Echo::Nothing, show_request: show_nothing, show_response: show_stdin_line },
+        Hosted { symbol: "hosted_file_read_utf8", echo: Echo::Nothing, show_request: show_native_path, show_response: show_str_result },
+        Hosted { symbol: "hosted_utc_now", echo: Echo::Nothing, show_request: show_nothing, show_response: show_utc_now },
+    ],
+    entries: &[Entry {
+        name: "main!",
+        after: &[],
+        replay: |request| crate::run_main(decode_args(request).expect("main! request is not process args")).to_le_bytes().to_vec(),
+        ok: |response| exit_code(response) == 0,
+        show_request: show_args,
+        show_response: |response| exit_code(response).to_string(),
+    }],
+};
+
+// ---------------------------------------------------------------- main!
+
+pub fn encode_args(args: &[OsString]) -> Vec<u8> {
+    let mut b = Vec::new();
+    for a in args {
+        b.extend_from_slice(&(a.len() as u32).to_le_bytes());
+        b.extend_from_slice(a.as_bytes());
+    }
+    b
+}
+
+fn decode_args(mut b: &[u8]) -> Option<Vec<OsString>> {
+    let mut out = Vec::new();
+    while !b.is_empty() {
+        let n = u32::from_le_bytes(b.get(0..4)?.try_into().unwrap()) as usize;
+        out.push(OsString::from_vec(b.get(4..4 + n)?.to_vec()));
+        b = &b[4 + n..];
+    }
+    Some(out)
+}
+
+fn exit_code(response: &[u8]) -> i32 {
+    i32::from_le_bytes(response[0..4].try_into().unwrap())
+}
+
+fn show_args(request: &[u8]) -> String {
+    decode_args(request).map_or("unreadable".into(), |a| format!("{:?}", a.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>()))
+}
+
+// ---------------------------------------------------------------- codecs
 
 // IOErr tags with no payload, in a fixed order: the byte is the index.
 const IO_KINDS: [io::ErrorKind; 9] = [
@@ -67,44 +122,78 @@ pub fn decode_utc_now(bytes: &[u8]) -> Result<u128, ()> {
     }
 }
 
-// ---------------------------------------------------------------- display
-//
-// MVP 3, `ROC_LEDGER=dump:<dir>`: one display fn per wrapped function, in the
-// terms of its `Host.roc` signature, so a dump shows the values Roc saw.
-// `None`: this build has no codec for the symbol.
-
-pub fn display_request(effect: &str, request: &[u8]) -> Option<String> {
-    match effect {
-        "hosted_stdout_line" | "hosted_stderr_line" => Some(roc_str(&String::from_utf8_lossy(request))),
-        "hosted_stdin_line" | "hosted_utc_now" => Some(String::new()),
-        "hosted_file_read_utf8" => Some(native_path(request)),
-        _ => None,
+/// `hosted_stdout_line`/`hosted_stderr_line` response: 0 | 1 + raw os error (i32 LE).
+pub fn encode_unit_response(result: &io::Result<()>) -> Vec<u8> {
+    match result {
+        Ok(()) => vec![0],
+        Err(e) => [&[1u8][..], &e.raw_os_error().unwrap_or(0).to_le_bytes()].concat(),
     }
 }
 
-pub fn display_response(effect: &str, response: &[u8]) -> Option<String> {
-    let unit = |tag: &str| match crate::decode_unit_response(response) {
+pub fn decode_unit_response(response: &[u8]) -> io::Result<()> {
+    match response[0] {
+        0 => Ok(()),
+        _ => Err(io::Error::from_raw_os_error(i32::from_le_bytes(response[1..5].try_into().unwrap()))),
+    }
+}
+
+/// `hosted_stdin_line` response: 0 + line | 1 (EOF) | 2 + raw os error (i32 LE).
+pub fn encode_stdin_line_response(result: &io::Result<Option<String>>) -> Vec<u8> {
+    match result {
+        Ok(Some(line)) => [&[0u8][..], line.as_bytes()].concat(),
+        Ok(None) => vec![1],
+        Err(e) => [&[2u8][..], &e.raw_os_error().unwrap_or(0).to_le_bytes()].concat(),
+    }
+}
+
+pub fn decode_stdin_line_response(response: &[u8]) -> io::Result<Option<String>> {
+    match response[0] {
+        0 => Ok(Some(String::from_utf8_lossy(&response[1..]).into_owned())),
+        1 => Ok(None),
+        _ => Err(io::Error::from_raw_os_error(i32::from_le_bytes(response[1..5].try_into().unwrap()))),
+    }
+}
+
+// ---------------------------------------------------------------- display
+//
+// In the terms of each function's `Host.roc` signature, so a dump shows the
+// values Roc saw.
+
+fn show_nothing(_: &[u8]) -> String {
+    String::new()
+}
+
+fn show_line(request: &[u8]) -> String {
+    roc_str(&String::from_utf8_lossy(request))
+}
+
+fn show_unit(response: &[u8], tag: &str) -> String {
+    match decode_unit_response(response) {
         Ok(()) => "Ok({})".to_string(),
         Err(error) => format!("Err({tag}({}))", roc_io_err(&error)),
-    };
-    Some(match effect {
-        "hosted_stdout_line" => unit("StdoutErr"),
-        "hosted_stderr_line" => unit("StderrErr"),
-        "hosted_stdin_line" => match crate::decode_stdin_line_response(response) {
-            Ok(Some(line)) => format!("Ok({})", roc_str(&line)),
-            Ok(None) => "Err(EndOfFile)".to_string(),
-            Err(error) => format!("Err(StdinErr({}))", roc_io_err(&error)),
-        },
-        "hosted_file_read_utf8" => match decode_str_result(response) {
-            Ok(content) => format!("Ok({})", roc_str(&content)),
-            Err(error) => format!("Err(FileErr({}))", roc_io_err(&error)),
-        },
-        "hosted_utc_now" => match decode_utc_now(response) {
-            Ok(nanos) => format!("Ok({nanos})  # {}", iso_utc(nanos)),
-            Err(()) => "Err(ClockBeforeEpoch)".to_string(),
-        },
-        _ => return None,
-    })
+    }
+}
+
+fn show_stdin_line(response: &[u8]) -> String {
+    match decode_stdin_line_response(response) {
+        Ok(Some(line)) => format!("Ok({})", roc_str(&line)),
+        Ok(None) => "Err(EndOfFile)".to_string(),
+        Err(error) => format!("Err(StdinErr({}))", roc_io_err(&error)),
+    }
+}
+
+fn show_str_result(response: &[u8]) -> String {
+    match decode_str_result(response) {
+        Ok(content) => format!("Ok({})", roc_str(&content)),
+        Err(error) => format!("Err(FileErr({}))", roc_io_err(&error)),
+    }
+}
+
+fn show_utc_now(response: &[u8]) -> String {
+    match decode_utc_now(response) {
+        Ok(nanos) => format!("Ok({nanos})  # {}", iso_utc(nanos)),
+        Err(()) => "Err(ClockBeforeEpoch)".to_string(),
+    }
 }
 
 fn roc_str(s: &str) -> String {
@@ -119,7 +208,7 @@ fn roc_io_err(error: &io::Error) -> String {
 }
 
 // `NativePath`: tag byte, then its bytes. Bytes show as a string when they're UTF-8.
-fn native_path(request: &[u8]) -> String {
+fn show_native_path(request: &[u8]) -> String {
     let body = &request[1..];
     match request[0] {
         0 => match std::str::from_utf8(body) {
@@ -132,23 +221,6 @@ fn native_path(request: &[u8]) -> String {
             format!("WindowsU16s({})", roc_str(&String::from_utf16_lossy(&units)))
         }
     }
-}
-
-/// Nanoseconds since the epoch as ISO 8601 UTC, to the microsecond.
-pub fn iso_utc(nanos: u128) -> String {
-    let secs = (nanos / 1_000_000_000) as i64;
-    let micros = (nanos % 1_000_000_000) / 1000;
-    let (days, sod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{micros:06}Z", sod / 3600, sod % 3600 / 60, sod % 60)
 }
 
 #[cfg(test)]
@@ -172,6 +244,10 @@ mod tests {
             io::Error::other("custom ünïcode message"),
             io::Error::other(""),
         ]
+    }
+
+    fn hosted(symbol: &str) -> &'static Hosted {
+        BOUNDARY.hosted.iter().find(|h| h.symbol == symbol).unwrap()
     }
 
     #[test]
@@ -205,7 +281,6 @@ mod tests {
             let decoded = decode_str_result(&encode_str_result(&Ok(content.to_string()))).unwrap();
             assert_eq!(decoded, content);
         }
-        // io::Error isn't Clone: build each error twice.
         let errors = || other_errors().into_iter().chain(IO_KINDS.map(io::Error::from));
         for (error, expected) in errors().zip(errors()) {
             let decoded = decode_str_result(&encode_str_result(&Err(error))).unwrap_err();
@@ -221,22 +296,20 @@ mod tests {
     }
 
     #[test]
-    fn iso_utc_formats() {
-        assert_eq!(iso_utc(0), "1970-01-01T00:00:00.000000Z");
-        // The MVP 1 crash: the app printed "Agenda at 2026-10-07T19:07:45Z".
-        assert_eq!(iso_utc(1_791_400_065_828_387_000), "2026-10-07T19:07:45.828387Z");
-        assert_eq!(iso_utc(951_782_400_000_000_000), "2000-02-29T00:00:00.000000Z");
+    fn args_round_trip() {
+        let args: Vec<OsString> = vec!["./agenda".into(), "tasks.txt".into(), "".into()];
+        assert_eq!(decode_args(&encode_args(&args)).unwrap(), args);
     }
 
     #[test]
     fn display_shows_what_roc_saw() {
-        let read = |r: io::Result<String>| display_response("hosted_file_read_utf8", &encode_str_result(&r)).unwrap();
+        let read = |r: io::Result<String>| (hosted("hosted_file_read_utf8").show_response)(&encode_str_result(&r));
         assert_eq!(read(Ok("a\n".into())), r#"Ok("a\n")"#);
         assert_eq!(read(Err(io::Error::from(io::ErrorKind::NotFound))), "Err(FileErr(NotFound))");
         assert_eq!(read(Err(io::Error::from_raw_os_error(libc::EIO))), r#"Err(FileErr(Other("Input/output error (os error 5)")))"#);
-        assert_eq!(display_request("hosted_file_read_utf8", b"\0tasks.txt").unwrap(), r#"UnixBytes("tasks.txt")"#);
-        assert_eq!(display_response("hosted_utc_now", &encode_utc_now(&Err(()))).unwrap(), "Err(ClockBeforeEpoch)");
-        assert_eq!(display_response("hosted_stdout_line", &crate::encode_unit_response(&Err(io::Error::from_raw_os_error(libc::EPIPE)))).unwrap(), "Err(StdoutErr(BrokenPipe))");
-        assert_eq!(display_response("hosted_file_delete", b""), None);
+        assert_eq!((hosted("hosted_file_read_utf8").show_request)(b"\0tasks.txt"), r#"UnixBytes("tasks.txt")"#);
+        assert_eq!((hosted("hosted_utc_now").show_response)(&encode_utc_now(&Err(()))), "Err(ClockBeforeEpoch)");
+        assert_eq!((hosted("hosted_stdout_line").show_response)(&encode_unit_response(&Err(io::Error::from_raw_os_error(libc::EPIPE)))), "Err(StdoutErr(BrokenPipe))");
+        assert_eq!((BOUNDARY.entries[0].show_request)(&encode_args(&["./agenda".into(), "tasks.txt".into()])), r#"["./agenda", "tasks.txt"]"#);
     }
 }

@@ -23,12 +23,11 @@ mod process_service;
 mod sqlite;
 mod tcp;
 mod listener;
-// PROTOTYPE: effect ledger supervisor wiring (throwaway)
-mod ledger_prototype;
-// MVP: codecs for the file_read_utf8 and utc_now wrappers
-mod ledger_codec;
+// PROTOTYPE: basic-cli's binding to the effect-ledger library
+mod ledger;
 
 use crate::roc_platform_abi::*;
+use effect_ledger::Cross;
 
 // RustGlue assigns numbered names (TryTypeN, IOErrTypeN, ...) to anonymous Roc
 // records and result types, and the numbers shift whenever a module is added.
@@ -1444,24 +1443,22 @@ pub extern "C" fn hosted_file_read_bytes(path: UnixBytesOrUtf8OrWindowsU16s) -> 
     }
 }
 
-// MVP: hand-written ledger wrapper; codegen would emit these.
-// Request bytes: native_path_request. Response bytes: ledger_codec::encode_str_result.
+// PROTOTYPE: hand-written ledger wrapper; codegen would emit these.
 #[no_mangle]
 pub extern "C" fn hosted_file_read_utf8(path: UnixBytesOrUtf8OrWindowsU16s) -> FileStrResult {
     let roc_host = roc_host();
-    let Some(link) = ledger_prototype::link() else {
-        return file_str_to_roc(file_read_utf8_io(path, roc_host), roc_host);
-    };
     // Encode the request before path_from_native releases it.
-    let seq = link.begin("hosted_file_read_utf8", &native_path_request(&path));
-    let result = if link.replaying() {
-        // The inner fn would have consumed the argument; replay must too.
-        let _ = path_from_native(path, roc_host);
-        ledger_codec::decode_str_result(&link.await_response())
-    } else {
-        let result = file_read_utf8_io(path, roc_host);
-        link.end(seq, &ledger_codec::encode_str_result(&result));
-        result
+    let result = match effect_ledger::cross("hosted_file_read_utf8", || native_path_request(&path)) {
+        Cross::Replay(response) => {
+            // The real call would have consumed the argument; replay must too.
+            let _ = path_from_native(path, roc_host);
+            ledger::decode_str_result(&response)
+        }
+        live => {
+            let result = file_read_utf8_io(path, roc_host);
+            live.record(|| ledger::encode_str_result(&result));
+            result
+        }
     };
     file_str_to_roc(result, roc_host)
 }
@@ -2070,18 +2067,12 @@ pub extern "C" fn hosted_sleep_millis(millis: u64) {
 pub extern "C" fn hosted_stderr_line(message: RocStr) -> StderrUnitResult {
     // PROTOTYPE: wrapped too, because main_for_host! reports an unhandled Err here.
     let roc_host = roc_host();
-    let write = |message: &RocStr| writeln!(io::stderr().lock(), "{}", message.as_str());
-    let result = match ledger_prototype::link() {
-        None => write(&message),
-        Some(link) => {
-            let seq = link.begin("hosted_stderr_line", message.as_str().as_bytes());
-            if link.replaying() {
-                decode_unit_response(&link.await_response())
-            } else {
-                let result = write(&message);
-                link.end(seq, &encode_unit_response(&result));
-                result
-            }
+    let result = match effect_ledger::cross("hosted_stderr_line", || message.as_str().as_bytes().to_vec()) {
+        Cross::Replay(response) => ledger::decode_unit_response(&response),
+        live => {
+            let result = writeln!(io::stderr().lock(), "{}", message.as_str());
+            live.record(|| ledger::encode_unit_response(&result));
+            result
         }
     };
     unsafe { message.decref(roc_host) };
@@ -2121,35 +2112,17 @@ pub extern "C" fn hosted_stderr_write_bytes(bytes: RocListWith<u8, false>) -> St
 }
 
 // PROTOTYPE: hand-written ledger wrapper; codegen would emit these.
-// Response bytes: 0 + line | 1 (EOF) | 2 + raw os error (i32 LE).
 #[no_mangle]
 pub extern "C" fn hosted_stdin_line() -> HostStdinLineResult {
-    let Some(link) = ledger_prototype::link() else {
-        return stdin_line_to_roc(stdin_line_io());
-    };
-    let seq = link.begin("hosted_stdin_line", &[]);
-    let result = if link.replaying() {
-        decode_stdin_line_response(&link.await_response())
-    } else {
-        let result = stdin_line_io();
-        let response = match &result {
-            Ok(Some(line)) => [&[0u8][..], line.as_bytes()].concat(),
-            Ok(None) => vec![1],
-            Err(e) => [&[2u8][..], &e.raw_os_error().unwrap_or(0).to_le_bytes()].concat(),
-        };
-        link.end(seq, &response);
-        result
+    let result = match effect_ledger::cross("hosted_stdin_line", Vec::new) {
+        Cross::Replay(response) => ledger::decode_stdin_line_response(&response),
+        live => {
+            let result = stdin_line_io();
+            live.record(|| ledger::encode_stdin_line_response(&result));
+            result
+        }
     };
     stdin_line_to_roc(result)
-}
-
-// MVP 3: shared by replay and dump.
-fn decode_stdin_line_response(response: &[u8]) -> io::Result<Option<String>> {
-    match response[0] {
-        0 => Ok(Some(String::from_utf8_lossy(&response[1..]).into_owned())),
-        1 => Ok(None),
-        _ => Err(io::Error::from_raw_os_error(i32::from_le_bytes(response[1..5].try_into().unwrap()))),
-    }
 }
 
 fn stdin_line_io() -> io::Result<Option<String>> {
@@ -2197,42 +2170,20 @@ pub extern "C" fn hosted_stdin_read_to_end() -> HostStdinReadToEndResult {
 }
 
 // PROTOTYPE: hand-written ledger wrapper; codegen would emit these.
-// Request bytes: the line. Response bytes: 0 | 1 + raw os error (i32 LE).
 #[no_mangle]
 pub extern "C" fn hosted_stdout_line(message: RocStr) -> StdoutUnitResult {
     let roc_host = roc_host();
-    let Some(link) = ledger_prototype::link() else {
-        let result = writeln!(io::stdout().lock(), "{}", message.as_str());
-        unsafe { message.decref(roc_host) };
-        return unit_result_to_roc(result, try_stdout_unit_ok, try_stdout_unit_err, stdout_io_err_from_io);
-    };
     // Encode the request before anything releases it.
-    let seq = link.begin("hosted_stdout_line", message.as_str().as_bytes());
-    let result = if link.replaying() {
-        // The inner fn would have consumed the argument; replay must too.
-        unsafe { message.decref(roc_host) };
-        decode_unit_response(&link.await_response())
-    } else {
-        let result = writeln!(io::stdout().lock(), "{}", message.as_str());
-        unsafe { message.decref(roc_host) };
-        link.end(seq, &encode_unit_response(&result));
-        result
+    let result = match effect_ledger::cross("hosted_stdout_line", || message.as_str().as_bytes().to_vec()) {
+        Cross::Replay(response) => ledger::decode_unit_response(&response),
+        live => {
+            let result = writeln!(io::stdout().lock(), "{}", message.as_str());
+            live.record(|| ledger::encode_unit_response(&result));
+            result
+        }
     };
+    unsafe { message.decref(roc_host) };
     unit_result_to_roc(result, try_stdout_unit_ok, try_stdout_unit_err, stdout_io_err_from_io)
-}
-
-fn encode_unit_response(result: &io::Result<()>) -> Vec<u8> {
-    match result {
-        Ok(()) => vec![0],
-        Err(e) => [&[1u8][..], &e.raw_os_error().unwrap_or(0).to_le_bytes()].concat(),
-    }
-}
-
-fn decode_unit_response(response: &[u8]) -> io::Result<()> {
-    match response[0] {
-        0 => Ok(()),
-        _ => Err(io::Error::from_raw_os_error(i32::from_le_bytes(response[1..5].try_into().unwrap()))),
-    }
 }
 
 fn unit_result_to_roc<T, E>(
@@ -2292,21 +2243,15 @@ pub extern "C" fn hosted_tty_enable_raw_mode() {
 // TODO(https://github.com/roc-lang/roc/issues/10163): revert to a bare u128
 // return once the compiler emits the clang/Rust u128 return convention on
 // x86_64-windows; bare u128 returns are currently misread there.
-// MVP: hand-written ledger wrapper. Request bytes: none. Response bytes:
-// ledger_codec::encode_utc_now.
+// PROTOTYPE: hand-written ledger wrapper; codegen would emit these.
 #[no_mangle]
 pub extern "C" fn hosted_utc_now() -> HostUtcNowResult {
-    let result = match ledger_prototype::link() {
-        None => utc_now_io(),
-        Some(link) => {
-            let seq = link.begin("hosted_utc_now", &[]);
-            if link.replaying() {
-                ledger_codec::decode_utc_now(&link.await_response())
-            } else {
-                let result = utc_now_io();
-                link.end(seq, &ledger_codec::encode_utc_now(&result));
-                result
-            }
+    let result = match effect_ledger::cross("hosted_utc_now", Vec::new) {
+        Cross::Replay(response) => ledger::decode_utc_now(&response),
+        live => {
+            let result = utc_now_io();
+            live.record(|| ledger::encode_utc_now(&result));
+            result
         }
     };
     match result {
@@ -2350,13 +2295,13 @@ pub extern "C" fn roc_dbg(bytes: *const u8, len: usize) {
 #[no_mangle]
 pub extern "C" fn roc_expect_failed(bytes: *const u8, len: usize) {
     DEBUG_OR_EXPECT_CALLED.store(true, Ordering::Release);
-    ledger_prototype::expect_failed(unsafe { core::slice::from_raw_parts(bytes, len) });
+    effect_ledger::expect_failed(unsafe { core::slice::from_raw_parts(bytes, len) });
     DefaultHandlers::roc_expect_failed(roc_host_ptr(), bytes, len);
 }
 
 #[no_mangle]
 pub extern "C" fn roc_crashed(bytes: *const u8, len: usize) {
-    ledger_prototype::crashed(unsafe { core::slice::from_raw_parts(bytes, len) });
+    effect_ledger::crashed(unsafe { core::slice::from_raw_parts(bytes, len) });
     DefaultHandlers::roc_crashed(roc_host_ptr(), bytes, len);
 }
 
@@ -2444,6 +2389,18 @@ pub extern "C" fn main(argc: i32, argv: *const *const c_char) -> i32 {
     rust_main(argc, argv)
 }
 
+/// The platform's one entry into the core: `main!`, whose request is the
+/// process args. Replay calls it with the recorded args.
+fn run_main(process_args: Vec<OsString>) -> i32 {
+    let request = effect_ledger::enter("main!", || ledger::encode_args(&process_args));
+    let (program_name, args) = split_program_name(process_args);
+    set_program_name(program_name);
+    let args_list = build_args_list(&args, roc_host());
+    let exit_code = unsafe { roc_main(args_list) };
+    request.leave(|| exit_code.to_le_bytes().to_vec());
+    exit_code
+}
+
 pub fn rust_main(argc: i32, argv: *const *const c_char) -> i32 {
     // Unlike a Rust executable, this C-ABI entrypoint does not pass through
     // std::rt's signal initialization. Return BrokenPipe from our I/O effects.
@@ -2452,18 +2409,17 @@ pub fn rust_main(argc: i32, argv: *const *const c_char) -> i32 {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
     let process_args = collect_process_args(argc, argv);
     // PROTOTYPE: a supervisor never runs Roc code; a ledger child carries on.
-    if let Some(code) = ledger_prototype::start(&process_args) {
+    if let Some(code) = effect_ledger::start(&ledger::BOUNDARY, &process_args) {
         return code;
     }
     let mut roc_host = resources::make_host();
     set_roc_host(&mut roc_host);
 
-    let (program_name, args) = split_program_name(process_args);
-    set_program_name(program_name);
-
-    let args_list = build_args_list(&args, &roc_host);
-    let mut exit_code = unsafe { roc_main(args_list) };
-    ledger_prototype::returned(exit_code);
+    let mut exit_code = if effect_ledger::replaying() {
+        effect_ledger::serve_replay()
+    } else {
+        run_main(process_args)
+    };
 
     process_service::shutdown();
 
